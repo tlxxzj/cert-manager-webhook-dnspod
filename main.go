@@ -1,15 +1,24 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
-
-	extapi "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	"k8s.io/client-go/rest"
+	"strings"
 
 	"github.com/cert-manager/cert-manager/pkg/acme/webhook/apis/acme/v1alpha1"
 	"github.com/cert-manager/cert-manager/pkg/acme/webhook/cmd"
+	"github.com/cert-manager/cert-manager/pkg/issuer/acme/dns/util"
+	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
+	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/errors"
+	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/profile"
+	dnspod "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/dnspod/v20210323"
+	v1 "k8s.io/api/core/v1"
+	extapi "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 var GroupName = os.Getenv("GROUP_NAME")
@@ -29,6 +38,13 @@ func main() {
 	)
 }
 
+func extractRecordName(fqdn, zone string) string {
+	if idx := strings.Index(fqdn, "."+zone); idx != -1 {
+		return fqdn[:idx]
+	}
+	return util.UnFqdn(fqdn)
+}
+
 // customDNSProviderSolver implements the provider-specific logic needed to
 // 'present' an ACME challenge TXT record for your own DNS provider.
 // To do so, it must implement the `github.com/cert-manager/cert-manager/pkg/acme/webhook.Solver`
@@ -40,7 +56,7 @@ type customDNSProviderSolver struct {
 	// 3. uncomment the relevant code in the Initialize method below
 	// 4. ensure your webhook's service account has the required RBAC role
 	//    assigned to it for interacting with the Kubernetes APIs you need.
-	//client kubernetes.Clientset
+	k8sClient *kubernetes.Clientset
 }
 
 // customDNSProviderConfig is a structure that is used to decode into when
@@ -65,6 +81,53 @@ type customDNSProviderConfig struct {
 
 	//Email           string `json:"email"`
 	//APIKeySecretRef v1alpha1.SecretKeySelector `json:"apiKeySecretRef"`
+
+	SecretIdRef  v1.SecretKeySelector `json:"secretIdRef"`
+	SecretKeyRef v1.SecretKeySelector `json:"secretKeyRef"`
+}
+
+func (s *customDNSProviderSolver) getSecretData(ns string, selector v1.SecretKeySelector) ([]byte, error) {
+	secret, err := s.k8sClient.CoreV1().Secrets(ns).Get(context.TODO(), selector.Name, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	data, ok := secret.Data[selector.Key]
+	if !ok {
+		return nil, fmt.Errorf("failed to load secret %s/%s/%s", ns, selector.Name, selector.Key)
+	}
+	return data, nil
+}
+
+func (s *customDNSProviderSolver) getCredential(ns string, config *customDNSProviderConfig) (*common.Credential, error) {
+	secretId, err := s.getSecretData(ns, config.SecretIdRef)
+	if err != nil {
+		return nil, err
+	}
+
+	secretKey, err := s.getSecretData(ns, config.SecretKeyRef)
+	if err != nil {
+		return nil, err
+	}
+	return common.NewCredential(string(secretId), string(secretKey)), nil
+}
+
+func (s *customDNSProviderSolver) getClient(ch *v1alpha1.ChallengeRequest) (*dnspod.Client, error) {
+	config, err := loadConfig(ch.Config)
+	if err != nil {
+		return nil, err
+	}
+
+	credential, err := s.getCredential(ch.ResourceNamespace, &config)
+	if err != nil {
+		return nil, err
+	}
+
+	client, err := dnspod.NewClient(credential, "", profile.NewClientProfile())
+	if err != nil {
+		return nil, err
+	}
+
+	return client, nil
 }
 
 // Name is used as the name for this DNS solver when referencing it on the ACME
@@ -74,7 +137,33 @@ type customDNSProviderConfig struct {
 // within a single webhook deployment**.
 // For example, `cloudflare` may be used as the name of a solver.
 func (c *customDNSProviderSolver) Name() string {
-	return "my-custom-solver"
+	return "dnspod"
+}
+
+func (s *customDNSProviderSolver) getRecordList(client *dnspod.Client, ch *v1alpha1.ChallengeRequest) ([]*dnspod.RecordListItem, error) {
+	zone, err := util.FindZoneByFqdn(ch.ResolvedZone, util.RecursiveNameservers)
+	if err != nil {
+		return []*dnspod.RecordListItem{}, err
+	}
+	domain := util.UnFqdn(zone)
+	recordName := extractRecordName(ch.ResolvedFQDN, ch.ResolvedZone)
+	req := dnspod.NewDescribeRecordListRequest()
+	req.Domain = &domain
+	req.Subdomain = &recordName
+	req.RecordType = common.StringPtr("TXT")
+	response, err := client.DescribeRecordList(req)
+
+	if sdkError, ok := err.(*errors.TencentCloudSDKError); ok {
+		fmt.Printf("An API error has returned: %s", err)
+		if sdkError.Code == "ResourceNotFound.NoDataOfRecord" {
+			return []*dnspod.RecordListItem{}, nil
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return response.Response.RecordList, nil
 }
 
 // Present is responsible for actually presenting the DNS record with the
@@ -82,16 +171,45 @@ func (c *customDNSProviderSolver) Name() string {
 // This method should tolerate being called multiple times with the same value.
 // cert-manager itself will later perform a self check to ensure that the
 // solver has correctly configured the DNS provider.
-func (c *customDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
-	cfg, err := loadConfig(ch.Config)
+func (s *customDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
+	zone, err := util.FindZoneByFqdn(ch.ResolvedZone, util.RecursiveNameservers)
+	if err != nil {
+		return err
+	}
+	domain := util.UnFqdn(zone)
+
+	client, err := s.getClient(ch)
 	if err != nil {
 		return err
 	}
 
-	// TODO: do something more useful with the decoded configuration
-	fmt.Printf("Decoded configuration %v", cfg)
+	recordList, err := s.getRecordList(client, ch)
+	if err != nil {
+		return err
+	}
 
-	// TODO: add code that sets a record in the DNS provider's console
+	recordNotExists := true
+	for _, record := range recordList {
+		if *record.Value == ch.Key {
+			recordNotExists = false
+			break
+		}
+	}
+
+	if recordNotExists {
+		recordName := extractRecordName(ch.ResolvedFQDN, ch.ResolvedZone)
+		req := dnspod.NewCreateRecordRequest()
+		req.Domain = &domain
+		req.SubDomain = &recordName
+		req.RecordType = common.StringPtr("TXT")
+		req.RecordLine = common.StringPtr("默认")
+		req.Value = &ch.Key
+		_, err := client.CreateRecord(req)
+		if err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -101,8 +219,36 @@ func (c *customDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 // value provided on the ChallengeRequest should be cleaned up.
 // This is in order to facilitate multiple DNS validations for the same domain
 // concurrently.
-func (c *customDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
+func (s *customDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
 	// TODO: add code that deletes a record from the DNS provider's console
+	zone, err := util.FindZoneByFqdn(ch.ResolvedZone, util.RecursiveNameservers)
+	if err != nil {
+		return err
+	}
+	domain := util.UnFqdn(zone)
+
+	client, err := s.getClient(ch)
+	if err != nil {
+		return err
+	}
+
+	recordList, err := s.getRecordList(client, ch)
+	if err != nil {
+		return err
+	}
+
+	for _, record := range recordList {
+		if *record.Value == ch.Key {
+			req := dnspod.NewDeleteRecordRequest()
+			req.Domain = &domain
+			req.RecordId = record.RecordId
+			_, err := client.DeleteRecord(req)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -119,12 +265,11 @@ func (c *customDNSProviderSolver) Initialize(kubeClientConfig *rest.Config, stop
 	///// UNCOMMENT THE BELOW CODE TO MAKE A KUBERNETES CLIENTSET AVAILABLE TO
 	///// YOUR CUSTOM DNS PROVIDER
 
-	//cl, err := kubernetes.NewForConfig(kubeClientConfig)
-	//if err != nil {
-	//	return err
-	//}
-	//
-	//c.client = cl
+	cl, err := kubernetes.NewForConfig(kubeClientConfig)
+	if err != nil {
+		return err
+	}
+	c.k8sClient = cl
 
 	///// END OF CODE TO MAKE KUBERNETES CLIENTSET AVAILABLE
 	return nil
