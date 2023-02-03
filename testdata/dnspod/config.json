@@ -1,0 +1,10 @@
+{
+    "secretIdRef": {
+      "name": "dnspod-secret",
+      "key": "secretId"
+    },
+    "secretKeyRef": {
+      "name": "dnspod-secret",
+      "key": "secretKey"
+    }
+  }

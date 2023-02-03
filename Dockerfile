@@ -11,7 +11,7 @@ RUN go mod download
 
 FROM build_deps AS build
 
-COPY . .
+COPY main.go main.go
 
 RUN CGO_ENABLED=0 go build -o webhook -ldflags '-w -extldflags "-static"' .
 
