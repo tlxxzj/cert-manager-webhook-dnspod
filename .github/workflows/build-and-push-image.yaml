@@ -20,7 +20,7 @@ jobs:
     - name: Extract metadata (tags, labels) for Docker
       uses: docker/metadata-action@v4
       with:
-        image: tlxxzj/cert-manager-webhook-dnspod
+        images: tlxxzj/cert-manager-webhook-dnspod
     
     - name: Build and push image
       uses: docker/build-push-action@v4
