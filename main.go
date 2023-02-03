@@ -140,12 +140,25 @@ func (c *customDNSProviderSolver) Name() string {
 	return "dnspod"
 }
 
+func (s *customDNSProviderSolver) getDomain(client *dnspod.Client, ch *v1alpha1.ChallengeRequest) (string, error) {
+	req := dnspod.NewDescribeDomainListRequest()
+	response, err := client.DescribeDomainList(req)
+	if err != nil {
+		return "", err
+	}
+	for _, item := range response.Response.DomainList {
+		if strings.HasSuffix(ch.ResolvedZone, *item.Name+".") {
+			return *item.Name, nil
+		}
+	}
+	return "", fmt.Errorf("failed to get domain for zone %s", ch.ResolvedZone)
+}
+
 func (s *customDNSProviderSolver) getRecordList(client *dnspod.Client, ch *v1alpha1.ChallengeRequest) ([]*dnspod.RecordListItem, error) {
-	zone, err := util.FindZoneByFqdn(ch.ResolvedZone, util.RecursiveNameservers)
+	domain, err := s.getDomain(client, ch)
 	if err != nil {
 		return []*dnspod.RecordListItem{}, err
 	}
-	domain := util.UnFqdn(zone)
 	recordName := extractRecordName(ch.ResolvedFQDN, ch.ResolvedZone)
 	req := dnspod.NewDescribeRecordListRequest()
 	req.Domain = &domain
@@ -174,13 +187,12 @@ func (s *customDNSProviderSolver) getRecordList(client *dnspod.Client, ch *v1alp
 // cert-manager itself will later perform a self check to ensure that the
 // solver has correctly configured the DNS provider.
 func (s *customDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
-	zone, err := util.FindZoneByFqdn(ch.ResolvedZone, util.RecursiveNameservers)
+	client, err := s.getClient(ch)
 	if err != nil {
 		return err
 	}
-	domain := util.UnFqdn(zone)
 
-	client, err := s.getClient(ch)
+	domain, err := s.getDomain(client, ch)
 	if err != nil {
 		return err
 	}
@@ -224,13 +236,13 @@ func (s *customDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 // concurrently.
 func (s *customDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
 	// TODO: add code that deletes a record from the DNS provider's console
-	zone, err := util.FindZoneByFqdn(ch.ResolvedZone, util.RecursiveNameservers)
+
+	client, err := s.getClient(ch)
 	if err != nil {
 		return err
 	}
-	domain := util.UnFqdn(zone)
 
-	client, err := s.getClient(ch)
+	domain, err := s.getDomain(client, ch)
 	if err != nil {
 		return err
 	}
