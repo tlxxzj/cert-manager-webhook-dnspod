@@ -37,6 +37,7 @@ build:
 rendered-manifest.yaml:
 	helm template \
 	        cert-manager-webhook-dnspod \
+			--namespace=cert-manager \
             --set image.repository=$(IMAGE_NAME) \
             --set image.tag=$(IMAGE_TAG) \
             deploy/cert-manager-webhook-dnspod > "$(OUT)/rendered-manifest.yaml"
