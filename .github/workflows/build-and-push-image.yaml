@@ -22,6 +22,8 @@ jobs:
       uses: docker/metadata-action@v4
       with:
         images: tlxxzj/cert-manager-webhook-dnspod
+        flavor: |
+          latest=false
     
     - name: Build and push image
       uses: docker/build-push-action@v4
