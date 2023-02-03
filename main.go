@@ -151,7 +151,9 @@ func (s *customDNSProviderSolver) getRecordList(client *dnspod.Client, ch *v1alp
 	req.Domain = &domain
 	req.Subdomain = &recordName
 	req.RecordType = common.StringPtr("TXT")
+	fmt.Println(req.ToJsonString())
 	response, err := client.DescribeRecordList(req)
+	fmt.Println(response.ToJsonString())
 
 	if sdkError, ok := err.(*errors.TencentCloudSDKError); ok {
 		fmt.Printf("An API error has returned: %s", err)
@@ -204,6 +206,7 @@ func (s *customDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 		req.RecordType = common.StringPtr("TXT")
 		req.RecordLine = common.StringPtr("默认")
 		req.Value = &ch.Key
+		fmt.Println(req.ToJsonString())
 		_, err := client.CreateRecord(req)
 		if err != nil {
 			return err
@@ -242,6 +245,7 @@ func (s *customDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
 			req := dnspod.NewDeleteRecordRequest()
 			req.Domain = &domain
 			req.RecordId = record.RecordId
+			fmt.Println(req.ToJsonString())
 			_, err := client.DeleteRecord(req)
 			if err != nil {
 				return err
