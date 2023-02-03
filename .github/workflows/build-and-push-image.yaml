@@ -18,6 +18,7 @@ jobs:
         password: ${{ secrets.DOCKERHUB_TOKEN }}
     
     - name: Extract metadata (tags, labels) for Docker
+      id: meta
       uses: docker/metadata-action@v4
       with:
         images: tlxxzj/cert-manager-webhook-dnspod
